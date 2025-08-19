@@ -61,6 +61,8 @@ DOI_REGEX = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
 # Simple URL extractor for plain text
 URL_REGEX = re.compile(r"https?://[^\s)]+", re.IGNORECASE)
 
+TRAILING_PUNCT = ");,.:\"'\]”’“‘>"  # common trailing punctuation/quotes
+
 # Module-level registry: folder_path -> metadata about discovered URLs and download status
 PAPER_URL_REGISTRY: Dict[str, Dict[str, Any]] = {}
 
@@ -238,12 +240,21 @@ def find_doi_in_text(text: str) -> Optional[str]:
 
 
 def find_urls_in_text(text: str) -> List[str]:
-    return list({m.group(0).strip() for m in URL_REGEX.finditer(text)})
+    raw = [m.group(0).strip() for m in URL_REGEX.finditer(text)]
+    out: List[str] = []
+    seen: Set[str] = set()
+    for u in raw:
+        nu = normalize_url(u)
+        if nu and nu not in seen:
+            seen.add(nu)
+            out.append(nu)
+    return out
 
 
 def doi_to_url(doi: str) -> str:
     # Strip any leading 'doi:'
     clean = re.sub(r"^doi:\s*", "", doi, flags=re.IGNORECASE).strip()
+    clean = normalize_doi(clean)
     return f"https://doi.org/{clean}"
 
 
@@ -264,10 +275,102 @@ def _add_to_dict_set(d: Dict[str, Set[str]], key: str, source: Path) -> None:
         d[key].add(abs_src)
 
 
+def normalize_url(url: str) -> str:
+    u = url.strip()
+    # Remove common trailing punctuation/quotes/brackets
+    while u and u[-1] in TRAILING_PUNCT:
+        u = u[:-1]
+    return u
+
+
+def normalize_doi(doi: str) -> str:
+    d = doi.strip()
+    while d and d[-1] in TRAILING_PUNCT:
+        d = d[:-1]
+    return d.lower()
+
+
+def normalize_pmid(pmid: str) -> str:
+    return pmid.strip().strip(TRAILING_PUNCT)
+
+
+def normalize_pmcid(pmcid: str) -> str:
+    p = pmcid.strip().strip(TRAILING_PUNCT)
+    m = re.match(r"pmc(\d+)$", p, flags=re.IGNORECASE)
+    return ("PMC" + m.group(1)) if m else p
+
+
+def extract_identifiers_from_text(text: str) -> Tuple[List[str], List[str], List[str], List[str]]:
+    """Return (urls, dois, pmids, pmc_ids) found in the text.
+
+    Duplicates are removed while preserving first-seen order.
+    """
+    urls_seen: Set[str] = set()
+    dois_seen: Set[str] = set()
+    pmids_seen: Set[str] = set()
+    pmc_seen: Set[str] = set()
+    urls: List[str] = []
+    dois: List[str] = []
+    pmids: List[str] = []
+    pmcs: List[str] = []
+
+    # URLs
+    for m in URL_REGEX.finditer(text):
+        u = normalize_url(m.group(0))
+        if u and u not in urls_seen:
+            urls_seen.add(u)
+            urls.append(u)
+        # Derive IDs from known URL patterns
+        pm_m = PUBMED_URL_REGEX.search(u)
+        if pm_m:
+            pid = normalize_pmid(pm_m.group(1))
+            if pid not in pmids_seen:
+                pmids_seen.add(pid)
+                pmids.append(pid)
+        pmc_m = PMC_URL_REGEX.search(u)
+        if pmc_m:
+            pc = normalize_pmcid(pmc_m.group(1))
+            if pc not in pmc_seen:
+                pmc_seen.add(pc)
+                pmcs.append(pc)
+        # DOI in URL (doi.org)
+        if "doi.org/" in u.lower():
+            dm = re.search(r"doi\.org/([^\s?#]+)", u, flags=re.IGNORECASE)
+            if dm:
+                dstr = normalize_doi(dm.group(1))
+                # Reconstruct canonical form
+                if dstr and dstr not in dois_seen:
+                    dois_seen.add(dstr)
+                    dois.append(dstr)
+
+    # DOI bare
+    for m in DOI_REGEX.finditer(text):
+        dstr = normalize_doi(m.group(0))
+        if dstr not in dois_seen:
+            dois_seen.add(dstr)
+            dois.append(dstr)
+
+    # PMID mentions
+    for m in PMID_NUM_REGEX.finditer(text):
+        pid = normalize_pmid(m.group(1))
+        if pid not in pmids_seen:
+            pmids_seen.add(pid)
+            pmids.append(pid)
+
+    # PMCID mentions
+    for m in PMCID_REGEX.finditer(text):
+        pc = normalize_pmcid(m.group(1))
+        if pc not in pmc_seen:
+            pmc_seen.add(pc)
+            pmcs.append(pc)
+
+    return urls, dois, pmids, pmcs
+
+
 def update_doi_record(doi: Optional[str], source: Path, *, title: Optional[str] = None, authors: Optional[str] = None, year: Optional[str] = None, venue: Optional[str] = None) -> None:
     if not doi:
         return
-    key = doi.strip()
+    key = normalize_doi(doi)
     if not key:
         return
     rec = DOI_IN_TEXT_DICT.get(key)
@@ -291,14 +394,14 @@ def extract_doi_from_url(url: str) -> Optional[str]:
     u = url.strip()
     m = re.search(r"doi\.org/([^\s?#]+)", u, flags=re.IGNORECASE)
     if m:
-        return m.group(1)
+        return normalize_doi(m.group(1))
     return None
 
 
 def update_url_record(url: str, source: Path) -> None:
     if not url:
         return
-    key = url.strip()
+    key = normalize_url(url)
     if not key:
         return
     rec = URL_RECORDS_DICT.get(key)
@@ -318,73 +421,6 @@ def update_url_record(url: str, source: Path) -> None:
                         rec[fld] = drec.get(fld)
     # Track source
     rec["sources"].add(str(source.resolve()))
-
-
-def extract_identifiers_from_text(text: str) -> Tuple[List[str], List[str], List[str], List[str]]:
-    """Return (urls, dois, pmids, pmc_ids) found in the text.
-
-    Duplicates are removed while preserving first-seen order.
-    """
-    urls_seen: Set[str] = set()
-    dois_seen: Set[str] = set()
-    pmids_seen: Set[str] = set()
-    pmc_seen: Set[str] = set()
-    urls: List[str] = []
-    dois: List[str] = []
-    pmids: List[str] = []
-    pmcs: List[str] = []
-
-    # URLs
-    for m in URL_REGEX.finditer(text):
-        u = m.group(0).strip().rstrip(').,;]')
-        if u and u not in urls_seen:
-            urls_seen.add(u)
-            urls.append(u)
-        # Derive IDs from known URL patterns
-        pm_m = PUBMED_URL_REGEX.search(u)
-        if pm_m:
-            pid = pm_m.group(1)
-            if pid not in pmids_seen:
-                pmids_seen.add(pid)
-                pmids.append(pid)
-        pmc_m = PMC_URL_REGEX.search(u)
-        if pmc_m:
-            pc = pmc_m.group(1)
-            if pc not in pmc_seen:
-                pmc_seen.add(pc)
-                pmcs.append(pc)
-        # DOI in URL (doi.org)
-        if "doi.org/" in u.lower():
-            dm = re.search(r"doi\.org/([^\s?#]+)", u, flags=re.IGNORECASE)
-            if dm:
-                dstr = dm.group(1)
-                # Reconstruct canonical form
-                if dstr and dstr not in dois_seen:
-                    dois_seen.add(dstr)
-                    dois.append(dstr)
-
-    # DOI bare
-    for m in DOI_REGEX.finditer(text):
-        dstr = m.group(0)
-        if dstr not in dois_seen:
-            dois_seen.add(dstr)
-            dois.append(dstr)
-
-    # PMID mentions
-    for m in PMID_NUM_REGEX.finditer(text):
-        pid = m.group(1)
-        if pid not in pmids_seen:
-            pmids_seen.add(pid)
-            pmids.append(pid)
-
-    # PMCID mentions
-    for m in PMCID_REGEX.finditer(text):
-        pc = m.group(1)
-        if pc not in pmc_seen:
-            pmc_seen.add(pc)
-            pmcs.append(pc)
-
-    return urls, dois, pmids, pmcs
 
 
 def update_link_dicts_from_text(text: str, source: Path) -> None:
@@ -820,6 +856,258 @@ def extract_metadata_from_folder(folder: Path, parse_control: Optional[ParseCont
     return best_doi, best_title, best_authors, best_year, best_venue, deduped_urls
 
 
+def parse_single_file(file_path: Path, parse_control: Optional[ParseControl]) -> None:
+    """Parse a single file by extension and update registries/dicts.
+
+    The folder is assumed to be the parent of the file.
+    """
+    folder = file_path.parent
+    fname = file_path.name
+    lower = fname.lower()
+
+    # bib
+    if lower.endswith('.bib'):
+        text = safe_read_text(file_path)
+        try:
+            allowed, reason = _check_parse_gate(file_path, parse_control)
+            if not allowed:
+                _register_document_status(file_path, folder, kind="bib", parsed=False, error=reason)
+                return
+            doi, title, authors, year, urls = parse_bibtex_for_metadata(text)
+            m = re.search(r"\b(journal|booktitle)\s*=\s*[\"{]([^\n\r}]+)[\"}]", text, re.IGNORECASE)
+            venue_guess = m.group(2).strip() if m else None
+            all_urls, all_dois, all_pmids, all_pmcs = extract_identifiers_from_text(text)
+            update_link_dicts_from_text(text, file_path)
+            for u in urls:
+                _add_to_dict_set(URL_DICT, u, file_path)
+                update_url_record(u, file_path)
+            update_doi_record(doi, file_path, title=title, authors=authors, year=year, venue=venue_guess)
+            for d_ in all_dois:
+                if d_ != doi:
+                    update_doi_record(d_, file_path)
+            _register_document_status(
+                file_path, folder, kind="bib", parsed=True, error=None,
+                info={
+                    "found_doi": bool(doi),
+                    "found_title": bool(title),
+                    "found_authors": bool(authors),
+                    "found_year": bool(year),
+                    "urls_found": len(urls),
+                    "urls_in_text": len(all_urls),
+                    "dois_in_text": len(all_dois),
+                    "pmids_in_text": len(all_pmids),
+                    "pmcids_in_text": len(all_pmcs),
+                },
+            )
+        except Exception as exc:
+            _register_document_status(file_path, folder, kind="bib", parsed=False, error=str(exc))
+        else:
+            if parse_control is not None:
+                parse_control.remaining_documents_to_parse -= 1
+        return
+
+    # ris/nbib
+    if lower.endswith('.ris') or lower.endswith('.nbib'):
+        text = safe_read_text(file_path)
+        try:
+            allowed, reason = _check_parse_gate(file_path, parse_control)
+            if not allowed:
+                _register_document_status(file_path, folder, kind="ris_nbib", parsed=False, error=reason)
+                return
+            doi, title, authors, year, venue, urls = parse_ris_like_for_metadata(text)
+            all_urls, all_dois, all_pmids, all_pmcs = extract_identifiers_from_text(text)
+            update_link_dicts_from_text(text, file_path)
+            for u in urls:
+                _add_to_dict_set(URL_DICT, u, file_path)
+                update_url_record(u, file_path)
+            update_doi_record(doi, file_path, title=title, authors=authors, year=year, venue=venue)
+            for d_ in all_dois:
+                if d_ != doi:
+                    update_doi_record(d_, file_path)
+            _register_document_status(
+                file_path, folder, kind="ris" if lower.endswith('.ris') else "nbib", parsed=True, error=None,
+                info={
+                    "found_doi": bool(doi),
+                    "found_title": bool(title),
+                    "found_authors": bool(authors),
+                    "found_year": bool(year),
+                    "found_venue": bool(venue),
+                    "urls_found": len(urls),
+                    "urls_in_text": len(all_urls),
+                    "dois_in_text": len(all_dois),
+                    "pmids_in_text": len(all_pmids),
+                    "pmcids_in_text": len(all_pmcs),
+                },
+            )
+        except Exception as exc:
+            _register_document_status(file_path, folder, kind="ris_nbib", parsed=False, error=str(exc))
+        else:
+            if parse_control is not None:
+                parse_control.remaining_documents_to_parse -= 1
+        return
+
+    # json
+    if lower.endswith('.json'):
+        text = safe_read_text(file_path)
+        try:
+            allowed, reason = _check_parse_gate(file_path, parse_control)
+            if not allowed:
+                _register_document_status(file_path, folder, kind="json", parsed=False, error=reason)
+                return
+            doi, title, authors, year, venue, urls = parse_json_for_metadata(text)
+            all_urls, all_dois, all_pmids, all_pmcs = extract_identifiers_from_text(text)
+            update_link_dicts_from_text(text, file_path)
+            for u in urls:
+                _add_to_dict_set(URL_DICT, u, file_path)
+                update_url_record(u, file_path)
+            update_doi_record(doi, file_path, title=title, authors=authors, year=year, venue=venue)
+            for d_ in all_dois:
+                if d_ != doi:
+                    update_doi_record(d_, file_path)
+            _register_document_status(
+                file_path, folder, kind="json", parsed=True, error=None,
+                info={
+                    "found_doi": bool(doi),
+                    "found_title": bool(title),
+                    "found_authors": bool(authors),
+                    "found_year": bool(year),
+                    "found_venue": bool(venue),
+                    "urls_found": len(urls),
+                    "urls_in_text": len(all_urls),
+                    "dois_in_text": len(all_dois),
+                    "pmids_in_text": len(all_pmids),
+                    "pmcids_in_text": len(all_pmcs),
+                },
+            )
+        except Exception as exc:
+            _register_document_status(file_path, folder, kind="json", parsed=False, error=str(exc))
+        else:
+            if parse_control is not None:
+                parse_control.remaining_documents_to_parse -= 1
+        return
+
+    # txt/md
+    if lower.endswith('.txt') or lower.endswith('.md'):
+        text = safe_read_text(file_path)
+        try:
+            allowed, reason = _check_parse_gate(file_path, parse_control)
+            if not allowed:
+                _register_document_status(file_path, folder, kind="txt_md", parsed=False, error=reason)
+                return
+            urls_found = find_urls_in_text(text)
+            all_urls, all_dois, all_pmids, all_pmcs = extract_identifiers_from_text(text)
+            update_link_dicts_from_text(text, file_path)
+            for d_ in all_dois:
+                update_doi_record(d_, file_path)
+            _register_document_status(
+                file_path, folder, kind="txt_md", parsed=True, error=None,
+                info={
+                    "urls_found": len(urls_found),
+                    "urls_in_text": len(all_urls),
+                    "dois_in_text": len(all_dois),
+                    "pmids_in_text": len(all_pmids),
+                    "pmcids_in_text": len(all_pmcs),
+                },
+            )
+        except Exception as exc:
+            _register_document_status(file_path, folder, kind="txt_md", parsed=False, error=str(exc))
+        else:
+            if parse_control is not None:
+                parse_control.remaining_documents_to_parse -= 1
+        return
+
+    # docx
+    if lower.endswith('.docx'):
+        try:
+            allowed, reason = _check_parse_gate(file_path, parse_control)
+            if not allowed:
+                _register_document_status(file_path, folder, kind="docx", parsed=False, error=reason)
+                return
+            import zipfile
+            text_parts: List[str] = []
+            with zipfile.ZipFile(file_path) as zf:
+                for name in [
+                    'word/document.xml',
+                    'word/footnotes.xml',
+                    'word/endnotes.xml',
+                    'word/header1.xml',
+                    'word/footer1.xml',
+                ]:
+                    if name in zf.namelist():
+                        data = zf.read(name)
+                        try:
+                            from xml.etree import ElementTree as ET
+                            root = ET.fromstring(data)
+                            text_parts.append(''.join(root.itertext()))
+                        except Exception:
+                            s = data.decode('utf-8', errors='ignore')
+                            s = re.sub(r'<[^>]+>', ' ', s)
+                            text_parts.append(s)
+            combined = '\n'.join(text_parts)
+            all_urls, all_dois, all_pmids, all_pmcs = extract_identifiers_from_text(combined)
+            update_link_dicts_from_text(combined, file_path)
+            for d_ in all_dois:
+                update_doi_record(d_, file_path)
+            _register_document_status(
+                file_path, folder, kind="docx", parsed=True, error=None,
+                info={
+                    "urls_in_text": len(all_urls),
+                    "dois_in_text": len(all_dois),
+                    "pmids_in_text": len(all_pmids),
+                    "pmcids_in_text": len(all_pmcs),
+                },
+            )
+        except Exception as exc:
+            _register_document_status(file_path, folder, kind="docx", parsed=False, error=str(exc))
+        else:
+            if parse_control is not None:
+                parse_control.remaining_documents_to_parse -= 1
+        return
+
+    # pdf
+    if lower.endswith('.pdf'):
+        try:
+            allowed, reason = _check_parse_gate(file_path, parse_control)
+            if not allowed:
+                _register_document_status(file_path, folder, kind="pdf", parsed=False, error=reason, info={"is_pdf": True})
+                return
+            raw = file_path.read_bytes()
+            try:
+                txt = raw.decode('utf-8', errors='ignore')
+            except Exception:
+                txt = raw.decode('latin-1', errors='ignore')
+            uri_candidates = re.findall(rb"/URI\s*\(([^)]+)\)", raw)
+            for b in uri_candidates:
+                try:
+                    candidate = b.decode('utf-8', errors='ignore')
+                    txt += '\n' + candidate
+                except Exception:
+                    pass
+            all_urls, all_dois, all_pmids, all_pmcs = extract_identifiers_from_text(txt)
+            update_link_dicts_from_text(txt, file_path)
+            for d_ in all_dois:
+                update_doi_record(d_, file_path)
+            _register_document_status(
+                file_path, folder, kind="pdf", parsed=True, error=None,
+                info={
+                    "is_pdf": True,
+                    "urls_in_text": len(all_urls),
+                    "dois_in_text": len(all_dois),
+                    "pmids_in_text": len(all_pmids),
+                    "pmcids_in_text": len(all_pmcs),
+                },
+            )
+        except Exception as exc:
+            _register_document_status(file_path, folder, kind="pdf", parsed=False, error=str(exc), info={"is_pdf": True})
+        else:
+            if parse_control is not None:
+                parse_control.remaining_documents_to_parse -= 1
+        return
+
+    # Unknown extension: mark as skipped
+    _register_document_status(file_path, folder, kind="other", parsed=False, error="unsupported_extension")
+
+
 def summarize_folder(root_input_dir: Path, folder: Path) -> Tuple[FolderSummary, List[str]]:
     num_files_total = 0
     num_dirs_total = 0
@@ -1044,6 +1332,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Optional path to write PMC ID dictionary as JSON (PMCID -> list of file paths).",
     )
     parser.add_argument(
+        "--output-url-dict-rich",
+        type=str,
+        default=None,
+        help="Optional path to write rich URL dictionary with inline metadata (URL -> {paths, doi, title, authors, year, venue}).",
+    )
+    parser.add_argument(
+        "--output-doi-dict-rich",
+        type=str,
+        default=None,
+        help="Optional path to write rich DOI dictionary with inline metadata (DOI -> {paths, urls, title, authors, year, venue, sources}).",
+    )
+    parser.add_argument(
         "--only-with-pdfs",
         action="store_true",
         help="Only include subfolders that contain at least one PDF.",
@@ -1075,6 +1375,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional path to preload a previous document parse registry (JSON) to enable cross-run skipping.",
+    )
+    parser.add_argument(
+        "--parse-file",
+        dest="parse_files",
+        action="append",
+        default=None,
+        help="Parse a specific file (repeatable). Useful to test parsers directly without scanning directories.",
     )
     return parser.parse_args(argv)
 
@@ -1120,22 +1427,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         skip_already_parsed=bool(args.skip_parsed),
     )
 
-    # If not disabled, set default output paths when flags are not provided
-    if not args.no_default_outputs:
-        if args.output_csv is None:
-            args.output_csv = DEFAULT_OUTPUT_FILES["csv"]
-        if args.output_json is None:
-            args.output_json = DEFAULT_OUTPUT_FILES["json"]
-        if args.output_doc_registry is None:
-            args.output_doc_registry = DEFAULT_OUTPUT_FILES["doc_registry"]
-        if getattr(args, "output_url_dict", None) is None:
-            args.output_url_dict = DEFAULT_OUTPUT_FILES["url_dict"]
-        if getattr(args, "output_doi_dict", None) is None:
-            args.output_doi_dict = DEFAULT_OUTPUT_FILES["doi_dict"]
-        if getattr(args, "output_pubmed_id_dict", None) is None:
-            args.output_pubmed_id_dict = DEFAULT_OUTPUT_FILES["pubmed_id_dict"]
-        if getattr(args, "output_pmc_id_dict", None) is None:
-            args.output_pmc_id_dict = DEFAULT_OUTPUT_FILES["pmc_id_dict"]
+    # If specific files were requested, parse them first
+    if args.parse_files:
+        for f in args.parse_files:
+            if _GLOBAL_PARSE_CONTROL.remaining_documents_to_parse <= 0:
+                break
+            path = Path(f).expanduser()
+            if not path.exists() or not path.is_file():
+                print(f"Warning: parse-file does not exist or is not a file: {path}", file=sys.stderr)
+                continue
+            try:
+                parse_single_file(path, _GLOBAL_PARSE_CONTROL)
+            except Exception as exc:
+                print(f"Error parsing file {path}: {exc}", file=sys.stderr)
 
     summaries: List[FolderSummary] = []
     for root_dir in input_dirs:
@@ -1261,7 +1565,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             base = Path(args.output_doi_dict).expanduser()
             out_path = base.parent / (base.stem + ".records.json")
-            # Convert sources set to list
+            # Build DOI -> URLs mapping from URL_RECORDS_DICT
+            doi_to_urls: Dict[str, Set[str]] = {}
+            for url_key, rec in URL_RECORDS_DICT.items():
+                doi_val = rec.get("doi")
+                if isinstance(doi_val, str) and doi_val:
+                    doi_to_urls.setdefault(doi_val, set()).add(url_key)
+            # Convert sources set to list and include urls
             serializable = {}
             for doi_key, rec in DOI_IN_TEXT_DICT.items():
                 serializable[doi_key] = {
@@ -1270,12 +1580,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "year": rec.get("year"),
                     "venue": rec.get("venue"),
                     "sources": sorted(list(rec.get("sources", set()))),
+                    "urls": sorted(list(doi_to_urls.get(doi_key, set()))),
                 }
             if args.output_write_mode == "append" and out_path.exists():
                 try:
                     existing = json.loads(out_path.read_text(encoding="utf-8"))
                     if isinstance(existing, dict):
-                        # Merge: prefer existing non-null metadata; union sources
+                        # Merge: prefer existing non-null metadata; union sources and urls
                         for doi_key, old in existing.items():
                             curr = serializable.get(doi_key)
                             if curr is None:
@@ -1287,6 +1598,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 old_sources = set(old.get("sources", []) if isinstance(old.get("sources"), list) else [])
                                 new_sources = set(curr.get("sources", []) if isinstance(curr.get("sources"), list) else [])
                                 curr["sources"] = sorted(list(old_sources | new_sources))
+                                old_urls = set(old.get("urls", []) if isinstance(old.get("urls"), list) else [])
+                                new_urls = set(curr.get("urls", []) if isinstance(curr.get("urls"), list) else [])
+                                curr["urls"] = sorted(list(old_urls | new_urls))
                 except Exception:
                     pass
             out_path.write_text(json.dumps(serializable, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1329,6 +1643,88 @@ def main(argv: Optional[List[str]] = None) -> int:
             out_path.write_text(json.dumps(serializable, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception as exc:
             print(f"Failed to write URL records: {exc}", file=sys.stderr)
+
+    # Write rich URL dict if requested: URL -> {paths, doi, title, authors, year, venue}
+    if args.output_url_dict_rich:
+        out_path = Path(args.output_url_dict_rich).expanduser()
+        try:
+            rich: Dict[str, Dict[str, Any]] = {}
+            for url_key, rec in URL_RECORDS_DICT.items():
+                paths = sorted(list(URL_DICT.get(url_key, set())))
+                rich[url_key] = {
+                    "paths": paths,
+                    "doi": rec.get("doi"),
+                    "title": rec.get("title"),
+                    "authors": rec.get("authors"),
+                    "year": rec.get("year"),
+                    "venue": rec.get("venue"),
+                }
+            if args.output_write_mode == "append" and out_path.exists():
+                try:
+                    existing = json.loads(out_path.read_text(encoding="utf-8"))
+                    if isinstance(existing, dict):
+                        for url_key, old in existing.items():
+                            curr = rich.get(url_key)
+                            if curr is None:
+                                rich[url_key] = old
+                            else:
+                                # Merge: union paths; prefer existing non-null metadata
+                                old_paths = set(old.get("paths", []) if isinstance(old.get("paths"), list) else [])
+                                curr_paths = set(curr.get("paths", []) if isinstance(curr.get("paths"), list) else [])
+                                curr["paths"] = sorted(list(old_paths | curr_paths))
+                                for fld in ("doi", "title", "authors", "year", "venue"):
+                                    if old.get(fld) and not curr.get(fld):
+                                        curr[fld] = old.get(fld)
+                except Exception:
+                    pass
+            out_path.write_text(json.dumps(rich, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as exc:
+            print(f"Failed to write rich URL dict: {exc}", file=sys.stderr)
+
+    # Write rich DOI dict if requested: DOI -> {paths, urls, title, authors, year, venue, sources}
+    if args.output_doi_dict_rich:
+        out_path = Path(args.output_doi_dict_rich).expanduser()
+        try:
+            # Build DOI -> URLs mapping from URL_RECORDS_DICT
+            doi_to_urls: Dict[str, Set[str]] = {}
+            for url_key, rec in URL_RECORDS_DICT.items():
+                doi_val = rec.get("doi")
+                if isinstance(doi_val, str) and doi_val:
+                    doi_to_urls.setdefault(doi_val, set()).add(url_key)
+            rich: Dict[str, Dict[str, Any]] = {}
+            for doi_key, rec in DOI_IN_TEXT_DICT.items():
+                paths = sorted(list(DOI_DICT.get(doi_key, set())))
+                rich[doi_key] = {
+                    "paths": paths,
+                    "urls": sorted(list(doi_to_urls.get(doi_key, set()))),
+                    "title": rec.get("title"),
+                    "authors": rec.get("authors"),
+                    "year": rec.get("year"),
+                    "venue": rec.get("venue"),
+                    "sources": sorted(list(rec.get("sources", set()))),
+                }
+            if args.output_write_mode == "append" and out_path.exists():
+                try:
+                    existing = json.loads(out_path.read_text(encoding="utf-8"))
+                    if isinstance(existing, dict):
+                        for doi_key, old in existing.items():
+                            curr = rich.get(doi_key)
+                            if curr is None:
+                                rich[doi_key] = old
+                            else:
+                                # Merge: union paths/urls/sources; prefer existing non-null metadata
+                                for field in ("paths", "urls", "sources"):
+                                    old_set = set(old.get(field, []) if isinstance(old.get(field), list) else [])
+                                    new_set = set(curr.get(field, []) if isinstance(curr.get(field), list) else [])
+                                    curr[field] = sorted(list(old_set | new_set))
+                                for fld in ("title", "authors", "year", "venue"):
+                                    if old.get(fld) and not curr.get(fld):
+                                        curr[fld] = old.get(fld)
+                except Exception:
+                    pass
+            out_path.write_text(json.dumps(rich, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as exc:
+            print(f"Failed to write rich DOI dict: {exc}", file=sys.stderr)
 
     return 0
 
